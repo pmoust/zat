@@ -2,9 +2,13 @@ package google
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log"
 	"testing"
+	"time"
+
+	"golang.org/x/oauth2"
 )
 
 func TestNewClientFromReader(t *testing.T) {
@@ -75,5 +79,81 @@ func TestNewClientFromReader(t *testing.T) {
 			got, err := NewClientFromReader(log.New(&clog, "", 0), &config)
 			tt.validate(t, got, err)
 		})
+	}
+}
+
+func hasScope(scopes []string, want string) bool {
+	for _, s := range scopes {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestDefaultScopesExcludeMeet verifies Meet is not requested by default, so
+// Drive/Zoom-only users aren't prompted for Meet permissions.
+func TestDefaultScopesExcludeMeet(t *testing.T) {
+	cfg := []byte(`{"web":{"client_id":"id","client_secret":"secret","redirect_uris":["http://r"],"auth_uri":"http://a","token_uri":"http://t"}}`)
+	var clog bytes.Buffer
+	c, err := NewClientFromReader(log.New(&clog, "", 0), bytes.NewReader(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasScope(c.config.Scopes, MeetScope) {
+		t.Errorf("did not expect meet scope by default, got %v", c.config.Scopes)
+	}
+}
+
+// TestWithMeetScope verifies the opt-in option adds the Meet scope.
+func TestWithMeetScope(t *testing.T) {
+	cfg := []byte(`{"web":{"client_id":"id","client_secret":"secret","redirect_uris":["http://r"],"auth_uri":"http://a","token_uri":"http://t"}}`)
+	var clog bytes.Buffer
+	c, err := NewClientFromReader(log.New(&clog, "", 0), bytes.NewReader(cfg), WithMeetScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasScope(c.config.Scopes, MeetScope) {
+		t.Errorf("expected meet scope with WithMeetScope(), got %v", c.config.Scopes)
+	}
+}
+
+func TestTokenSource(t *testing.T) {
+	cfg := []byte(`{"web":{"client_id":"id","client_secret":"secret","redirect_uris":["http://r"],"auth_uri":"http://a","token_uri":"http://t"}}`)
+	var clog bytes.Buffer
+	c, err := NewClientFromReader(log.New(&clog, "", 0), bytes.NewReader(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.credentials = &oauth2.Token{AccessToken: "x"}
+	if c.TokenSource(context.Background()) == nil {
+		t.Error("expected non-nil token source")
+	}
+}
+
+// TestTokenSourceLazy verifies a source handed out before login (no creds)
+// errors cleanly rather than panicking, and then resolves credentials that
+// arrive afterward - the web-login-first flow.
+func TestTokenSourceLazy(t *testing.T) {
+	cfg := []byte(`{"web":{"client_id":"id","client_secret":"secret","redirect_uris":["http://r"],"auth_uri":"http://a","token_uri":"http://t"}}`)
+	var clog bytes.Buffer
+	c, err := NewClientFromReader(log.New(&clog, "", 0), bytes.NewReader(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := c.TokenSource(context.Background()) // built before any creds exist
+	if _, err := ts.Token(); err == nil {
+		t.Error("expected error from token source before credentials exist")
+	}
+
+	// credentials arrive later (e.g. via the OAuth web callback)
+	c.credentials = &oauth2.Token{AccessToken: "live-token", Expiry: time.Now().Add(time.Hour)}
+	tok, err := ts.Token()
+	if err != nil {
+		t.Fatalf("expected token after creds arrive, got error: %v", err)
+	}
+	if tok.AccessToken != "live-token" {
+		t.Errorf("expected live-token, got %q", tok.AccessToken)
 	}
 }

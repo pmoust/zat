@@ -24,6 +24,7 @@ import (
 
 	"github.com/graphaelli/zat/cmd"
 	"github.com/graphaelli/zat/google"
+	"github.com/graphaelli/zat/meet"
 	"github.com/graphaelli/zat/slack"
 	"github.com/graphaelli/zat/zoom"
 )
@@ -44,6 +45,10 @@ func NewMux(zat *Config, params runParams) *http.ServeMux {
 	logger := zat.logger
 	googleClient := zat.googleClient
 	zoomClient := zat.zoomClient
+	meetClient := zat.meetClient
+
+	// zoomClient is nil when no zoom config is present (Meet-only install).
+	zoomReady := func() bool { return zoomClient != nil && zoomClient.HasCreds() }
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -65,18 +70,29 @@ func NewMux(zat *Config, params runParams) *http.ServeMux {
 			mw.Write([]byte("<span style=\"color:green\">OK</span>"))
 		}
 
-		mw.Write([]byte("<br>Zoom: "))
-		if !zoomClient.HasCreds() {
-			mw.Write([]byte("<a href=\"/zoom\">login</a>"))
-			//zoomClient.OauthRedirect(w, r)
-			//return
-		} else {
-			mw.Write([]byte("<span style=\"color:green\">OK</span>"))
+		if zoomClient != nil {
+			mw.Write([]byte("<br>Zoom: "))
+			if !zoomReady() {
+				mw.Write([]byte("<a href=\"/zoom\">login</a>"))
+				//zoomClient.OauthRedirect(w, r)
+				//return
+			} else {
+				mw.Write([]byte("<span style=\"color:green\">OK</span>"))
+			}
+		}
+
+		if meetClient != nil {
+			mw.Write([]byte("<br>Meet: "))
+			if googleClient.HasCreds() {
+				mw.Write([]byte("<span style=\"color:green\">OK</span>"))
+			} else {
+				mw.Write([]byte("<a href=\"/google\">login</a>"))
+			}
 		}
 
 		if archIsRunning {
 			mw.Write([]byte("<br/>Archiving...</a>"))
-		} else if googleClient.HasCreds() && zoomClient.HasCreds() {
+		} else if googleClient.HasCreds() && (zoomReady() || len(zat.meetCopies) > 0) {
 			mw.Write([]byte("<br/><a href=\"/archive\">Archive Now</a>"))
 		} else {
 			mw.Write([]byte("<br/>Login, to be able to archive"))
@@ -87,7 +103,7 @@ func NewMux(zat *Config, params runParams) *http.ServeMux {
 			for i := 0; i < len(archDetails); i++ {
 				arch := archDetails[i]
 				mw.Write([]byte(fmt.Sprintf("<tr><td><a href=\"%s\">%s</a></td><td>%s</td><td>%d</td><td><a href=\"%s\">%s</a></td></tr>",
-					arch.zoomUrl, arch.name, arch.date, arch.fileNumber, arch.googleDriveURL, arch.status)))
+					arch.sourceUrl, arch.name, arch.date, arch.fileNumber, arch.googleDriveURL, arch.status)))
 			}
 			mw.Write([]byte("</table>"))
 		}
@@ -139,7 +155,12 @@ func NewMux(zat *Config, params runParams) *http.ServeMux {
 			return
 		}
 
-		if !zoomClient.HasCreds() {
+		if zoomClient == nil {
+			http.NotFound(w, r)
+			return
+		}
+
+		if !zoomReady() {
 			logger.Print("no zoom credentials, redirecting")
 			zoomClient.OauthRedirect(w, r)
 			return
@@ -160,8 +181,37 @@ func NewMux(zat *Config, params runParams) *http.ServeMux {
 		}
 	})
 
+	mux.HandleFunc("/meet", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/meet" {
+			http.NotFound(w, r)
+			return
+		}
+		if meetClient == nil {
+			// no Meet client configured; logging in won't change that
+			http.Error(w, "meet not configured", http.StatusServiceUnavailable)
+			return
+		}
+		if !googleClient.HasCreds() {
+			logger.Print("no google credentials for meet, redirecting")
+			googleClient.OauthRedirect(w, r)
+			return
+		}
+		conferences, err := meetClient.ListConferences(r.Context(), time.Now().Add(-168*time.Hour))
+		if err != nil {
+			logger.Print(err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(conferences); err != nil {
+			logger.Print(err)
+		}
+	})
+
 	mux.HandleFunc("/oauth/google", googleClient.OauthHandler())
-	mux.HandleFunc("/oauth/zoom", zoomClient.OauthHandler())
+	if zoomClient != nil {
+		mux.HandleFunc("/oauth/zoom", zoomClient.OauthHandler())
+	}
 	return mux
 }
 
@@ -169,6 +219,7 @@ type Directive struct {
 	Name   string `json:"name"`
 	Google string `json:"google"`
 	Zoom   string `json:"zoom"`
+	Meet   string `json:"meet"`
 	Slack  string `json:"slack"`
 }
 
@@ -179,57 +230,142 @@ var skipDirective = Directive{Name: "{skip"}
 type Config struct {
 	logger       *log.Logger
 	copies       map[int64]Directive
+	meetCopies   map[string]Directive
 	googleClient *google.Client
 	slackClient  *slackapi.Client
 	zoomClient   *zoom.Client
+	meetClient   *meet.Client
 }
 
 func NewConfigFromFile(logger *log.Logger, path string, googleClient *google.Client, zoomClient *zoom.Client,
-	slackClient *slackapi.Client) (*Config, error) {
+	meetClient *meet.Client, slackClient *slackapi.Client) (*Config, error) {
 	f, err := os.Open(path)
 
-	if err != nil && os.IsExist(err) {
+	// A missing config file is fine (zat runs with no directives); surface any
+	// other error (e.g. permissions) instead of silently using an empty config.
+	// os.IsExist is never true for an os.Open error, so the old guard swallowed
+	// real failures.
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 
 	var r io.Reader = f
 
-	// Use an empty io.Reader when the files doesn't exist on disk.
 	if f == nil {
 		r = bytes.NewReader(nil)
 	} else {
 		defer f.Close()
 	}
 
-	return NewConfigFromReader(logger, r, googleClient, zoomClient, slackClient)
+	return NewConfigFromReader(logger, r, googleClient, zoomClient, meetClient, slackClient)
 }
 
-func NewConfigFromReader(logger *log.Logger, r io.Reader, googleClient *google.Client, zoomClient *zoom.Client,
-	slackClient *slackapi.Client) (*Config, error) {
+// decodeDirectives reads the zat.yml directive list from r.
+func decodeDirectives(r io.Reader) ([]Directive, error) {
 	var directives []Directive
 	if err := yaml.NewDecoder(r).Decode(&directives); err != nil && err != io.EOF {
 		return nil, err
 	}
-	c := map[int64]Directive{}
+	return directives, nil
+}
+
+// loadDirectives reads directives from a file, treating a missing file as no
+// directives. Used to decide which Google scopes to request before building
+// the client.
+func loadDirectives(path string) ([]Directive, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	return decodeDirectives(f)
+}
+
+// meetConfigured reports whether any directive maps a Meet meeting.
+func meetConfigured(directives []Directive) bool {
 	for _, d := range directives {
-		key, err := strconv.ParseInt(strings.ReplaceAll(d.Zoom, "-", ""), 10, 64)
-		if err != nil {
-			return nil, err
+		if d.Meet != "" {
+			return true
 		}
-		if _, exists := c[key]; exists {
-			logger.Printf("config for %d already exists, disabling any action", key)
-			c[key] = skipDirective
-			continue
+	}
+	return false
+}
+
+func NewConfigFromReader(logger *log.Logger, r io.Reader, googleClient *google.Client, zoomClient *zoom.Client,
+	meetClient *meet.Client, slackClient *slackapi.Client) (*Config, error) {
+	directives, err := decodeDirectives(r)
+	if err != nil {
+		return nil, err
+	}
+	c := map[int64]Directive{}
+	mc := map[string]Directive{}
+	for _, d := range directives {
+		if d.Zoom != "" {
+			key, err := strconv.ParseInt(strings.ReplaceAll(d.Zoom, "-", ""), 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			if _, exists := c[key]; exists {
+				logger.Printf("config for zoom %d already exists, disabling any action", key)
+				c[key] = skipDirective
+			} else {
+				c[key] = d
+			}
 		}
-		c[key] = d
+		if d.Meet != "" {
+			mkey := normalizeMeetingCode(d.Meet)
+			if _, exists := mc[mkey]; exists {
+				logger.Printf("config for meet %s already exists, disabling any action", mkey)
+				mc[mkey] = skipDirective
+			} else {
+				mc[mkey] = d
+			}
+		}
 	}
 	return &Config{
 		logger:       logger,
 		copies:       c,
+		meetCopies:   mc,
 		googleClient: googleClient,
 		slackClient:  slackClient,
 		zoomClient:   zoomClient,
+		meetClient:   meetClient,
 	}, nil
+}
+
+// normalizeMeetingCode lowercases and strips separators so "abc-defg-hij"
+// and "ABCDEFGHIJ" map to the same directive key.
+func normalizeMeetingCode(s string) string {
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, " ", "")
+	return strings.ToLower(s)
+}
+
+// meetFolderName constructs the name of the gdrive folder for a Meet conference.
+func meetFolderName(conf meet.Conference) string {
+	return conf.StartTime.Format("2006-01-02")
+}
+
+// meetRecordingFileName constructs the destination file name for a Meet artifact.
+// Naming uses the configured directive Name since the Meet API does not reliably
+// expose a meeting title.
+func meetRecordingFileName(action Directive, conf meet.Conference, artifact meet.Artifact) string {
+	start := artifact.StartTime
+	if start.IsZero() {
+		start = conf.StartTime
+	}
+	baseName := fmt.Sprintf("%s %s", start.Format("2006-01-02-150405"), action.Name)
+	var ext string
+	switch artifact.Kind {
+	case "transcript":
+		ext = "transcript"
+	default: // recording
+		ext = "mp4"
+	}
+	return baseName + "." + ext
 }
 
 // meetingFolderName constructs the name of the gdrive folder containing the meeting
@@ -304,7 +440,7 @@ func (z *Config) Archive(ctx context.Context, meeting zoom.Meeting, params runPa
 		fileNumber: 0,
 		status:     "archiving",
 		date:       meeting.StartTime.Format("2006-01-02 15:04"),
-		zoomUrl:    meeting.ShareURL}
+		sourceUrl:  meeting.ShareURL}
 	archDetails = append(archDetails, &curArchMeeting)
 
 	// check what is already uploaded for this meeting
@@ -478,6 +614,145 @@ func (z *Config) Archive(ctx context.Context, meeting zoom.Meeting, params runPa
 	return nil
 }
 
+func (z *Config) archiveMeetConference(ctx context.Context, conf meet.Conference, params runParams) error {
+	span, ctx := apm.StartSpan(ctx, "archiveMeetConference", "app")
+	defer span.End()
+
+	// ListConferences returns every conference the account attended, so an
+	// unmapped or duplicate-disabled meeting code is the common case, not an
+	// error worth reporting to APM - log and skip quietly.
+	action := z.meetCopies[normalizeMeetingCode(conf.MeetingCode)]
+	if action == skipDirective {
+		z.logger.Printf("skipped mapping meet conference %q", conf.MeetingCode)
+		return nil
+	}
+	if action.Google == "" {
+		z.logger.Printf("no mapping found for meet conference %q, skipping", conf.MeetingCode)
+		return nil
+	}
+
+	// nothing to copy (e.g. a mapped meeting occurred but wasn't recorded) -
+	// skip before creating an empty dated folder in Drive.
+	if len(conf.Artifacts) == 0 {
+		z.logger.Printf("no artifacts for meet conference %q, skipping", conf.MeetingCode)
+		return nil
+	}
+
+	var curArchMeeting = archivedMeeting{
+		name:       action.Name,
+		fileNumber: 0,
+		status:     "archiving",
+		date:       conf.StartTime.Format("2006-01-02 15:04"),
+		sourceUrl:  conf.SourceURL,
+	}
+	archDetails = append(archDetails, &curArchMeeting)
+
+	gdrive, err := z.googleClient.Service(ctx)
+	if err != nil {
+		curArchMeeting.status = "error"
+		return fmt.Errorf("while creating gdrive client: %w", err)
+	}
+
+	parent, err := gdrive.Files.Get(action.Google).Context(ctx).SupportsAllDrives(true).Do()
+	if err != nil {
+		curArchMeeting.status = "error"
+		return fmt.Errorf("while finding parent of %q: %w", action.Google, err)
+	}
+
+	meetingFolder, err, created := mkdir(ctx, gdrive, parent, meetFolderName(conf))
+	if err != nil {
+		curArchMeeting.status = "error"
+		return fmt.Errorf("while finding/creating meeting folder: %w", err)
+	}
+	if created {
+		z.logger.Printf("created folder %s: https://drive.google.com/drive/folders/%s", meetingFolder.Name, meetingFolder.Id)
+	} else {
+		z.logger.Printf("using existing folder %s: https://drive.google.com/drive/folders/%s", meetingFolder.Name, meetingFolder.Id)
+	}
+	curArchMeeting.googleDriveURL = "https://drive.google.com/drive/folders/" + meetingFolder.Id
+
+	// list folder for this meeting to dedupe
+	alreadyUploaded := make(map[string]struct{})
+	nextPageToken := ""
+	for page := 0; page < 5; page++ {
+		call := gdrive.Files.List().
+			Context(ctx).
+			SupportsTeamDrives(true).
+			IncludeTeamDriveItems(true).
+			Q(fmt.Sprintf("%q in parents", meetingFolder.Id))
+		if nextPageToken != "" {
+			call = call.PageToken(nextPageToken)
+		}
+		meetingFiles, err := call.Do()
+		if err != nil {
+			curArchMeeting.status = "error"
+			return fmt.Errorf("while listing meeting folder: %w", err)
+		}
+		for _, f := range meetingFiles.Files {
+			alreadyUploaded[f.Name] = struct{}{}
+		}
+		if meetingFiles.NextPageToken == "" {
+			break
+		}
+		nextPageToken = meetingFiles.NextPageToken
+	}
+
+	exclude := func(string) bool { return false }
+	if params.uploadFilter != "" {
+		allowedFileTypes := map[string]bool{}
+		for _, uf := range strings.Split(params.uploadFilter, ",") {
+			allowedFileTypes[strings.ToLower(strings.TrimSpace(uf))] = true
+		}
+		exclude = func(kind string) bool {
+			return !allowedFileTypes[strings.ToLower(kind)]
+		}
+	}
+
+	notifyUpload := false
+	for _, a := range conf.Artifacts {
+		name := meetRecordingFileName(action, conf, a)
+		if exclude(a.Kind) {
+			z.logger.Printf("skipping copy %s, kind %q excluded", name, a.Kind)
+			continue
+		}
+		if _, exists := alreadyUploaded[name]; exists {
+			curArchMeeting.status = "done"
+			curArchMeeting.fileNumber++
+			z.logger.Printf("skipping copy %s to %s/%s, already exists", name, parent.Name, meetingFolder.Name)
+			continue
+		}
+		z.logger.Printf("copying %q to \"%s/%s\"", name, parent.Name, meetingFolder.Name)
+		_, err := gdrive.Files.Copy(a.DriveFileID, &drive.File{
+			Name:    name,
+			Parents: []string{meetingFolder.Id},
+		}).Context(ctx).SupportsAllDrives(true).Do()
+		if err != nil {
+			curArchMeeting.status = "error"
+			return fmt.Errorf("while copying %s (%s): %w", name, a.DriveFileID, err)
+		}
+		curArchMeeting.fileNumber++
+		z.logger.Printf("copied %q to %s/%s", name, parent.Name, meetingFolder.Name)
+		if a.Kind == "recording" {
+			notifyUpload = true
+		}
+	}
+
+	if notifyUpload && action.Slack != "" && z.slackClient != nil {
+		slackSpan, ctx := apm.StartSpan(ctx, "slack", "app")
+		body := fmt.Sprintf("%s recording now available: https://drive.google.com/drive/folders/%s", action.Name, meetingFolder.Id)
+		channel, _, text, err := z.slackClient.SendMessageContext(ctx, action.Slack, slackapi.MsgOptionText(body, true))
+		if err != nil {
+			z.logger.Printf("failed to notify slack %q: %s", action.Slack, err)
+			apm.CaptureError(ctx, err).Send()
+		} else {
+			z.logger.Printf("notified slack %q: %s", channel, text)
+		}
+		slackSpan.End()
+	}
+	curArchMeeting.status = "done"
+	return nil
+}
+
 type runParams struct {
 	minDuration  int
 	since        time.Duration
@@ -490,7 +765,6 @@ func (z *Config) Run(params runParams) error {
 	ctx := apm.ContextWithTransaction(context.Background(), tx)
 
 	z.logger.Print("archiving recordings")
-	archDetails = []*archivedMeeting{}
 	nextPageToken := ""
 	for {
 		recordings, err := z.zoomClient.ListRecordings(ctx, time.Now().Add(-1*params.since), nextPageToken)
@@ -517,12 +791,40 @@ func (z *Config) Run(params runParams) error {
 	return nil
 }
 
+func (z *Config) RunMeet(params runParams) error {
+	tx := apm.DefaultTracer.StartTransaction("archiveMeetRecordings", "background")
+	defer tx.End()
+	ctx := apm.ContextWithTransaction(context.Background(), tx)
+
+	z.logger.Print("archiving meet recordings")
+	conferences, err := z.meetClient.ListConferences(ctx, time.Now().Add(-1*params.since))
+	if err != nil {
+		apm.CaptureError(ctx, err).Send()
+		return fmt.Errorf("failed to list meet conferences: %w", err)
+	}
+	for _, conf := range conferences {
+		if !conf.EndTime.IsZero() && !conf.StartTime.IsZero() {
+			duration := int(conf.EndTime.Sub(conf.StartTime).Minutes())
+			if duration < params.minDuration {
+				z.logger.Printf("skipped %d minute meet conference at %s", duration, conf.StartTime)
+				continue
+			}
+		}
+		if err := z.archiveMeetConference(ctx, conf, params); err != nil {
+			z.logger.Print(err)
+			apm.CaptureError(ctx, err).Send()
+		}
+	}
+	z.logger.Print("done archiving meet recordings")
+	return nil
+}
+
 type archivedMeeting struct {
 	name           string
 	fileNumber     int
 	status         string
 	date           string
-	zoomUrl        string
+	sourceUrl      string
 	googleDriveURL string
 }
 
@@ -542,8 +844,10 @@ func doRun(zat *Config, params runParams) {
 		zat.logger.Println("no Google creds")
 		return
 	}
-	if !zat.zoomClient.HasCreds() {
-		zat.logger.Println("no Zoom creds")
+	// zoomClient is nil on a Meet-only install (no zoom config).
+	zoomReady := zat.zoomClient != nil && zat.zoomClient.HasCreds()
+	if !zoomReady && len(zat.meetCopies) == 0 {
+		zat.logger.Println("no Zoom creds and no Meet directives")
 		return
 	}
 
@@ -557,8 +861,19 @@ func doRun(zat *Config, params runParams) {
 		return
 	}
 
-	if err := zat.Run(params); err != nil {
-		zat.logger.Println(err)
+	// reset once per cycle, before any backend runs, so a Meet-only deployment
+	// (where Run is never called) doesn't accumulate rows across cycles.
+	archDetails = []*archivedMeeting{}
+
+	if zoomReady {
+		if err := zat.Run(params); err != nil {
+			zat.logger.Println(err)
+		}
+	}
+	if zat.meetClient != nil && len(zat.meetCopies) > 0 && zat.googleClient.HasCreds() {
+		if err := zat.RunMeet(params); err != nil {
+			zat.logger.Println(err)
+		}
 	}
 
 	archIsRunningMu.Lock()
@@ -573,8 +888,8 @@ func main() {
 	minDuration := flag.Int("min-duration", 5, "minimum meeting duration in minutes to archive")
 	since := flag.Duration("since", 168*time.Hour, "since")
 	uploadFilter := flag.String("t", "",
-		"comma separated list of file types to archive (mp4, m4a, timeline, transcript, chat, cc, csv), see: "+
-			"https://marketplace.zoom.us/docs/api-reference/zoom-api/cloud-recording/recordingget")
+		"comma separated list of file types to archive; Zoom: mp4, m4a, timeline, transcript, chat, cc, csv; "+
+			"Meet: recording, transcript")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "", cmd.LogFmt)
@@ -583,30 +898,59 @@ func main() {
 	http.DefaultClient = apmhttp.WrapClient(http.DefaultClient)
 	http.DefaultTransport = apmhttp.WrapRoundTripper(http.DefaultTransport)
 
+	zatConfigPath := path.Join(*cfgDir, cmd.ZatConfigPath)
+
+	// Decide up front whether Meet is in use, so the Google login only requests
+	// the Meet scope (and a Meet client is built) when there are meet directives.
+	// Drive/Zoom-only users aren't prompted for Meet permissions.
+	directives, err := loadDirectives(zatConfigPath)
+	if err != nil {
+		logger.Println("failed to load config", err)
+	}
+	useMeet := meetConfigured(directives)
+
+	googleOptions := []google.ClientOption{
+		google.NewCredentialsManager(path.Join(*cfgDir, cmd.GoogleCredsPath)).ClientOption,
+	}
+	if useMeet {
+		googleOptions = append(googleOptions, google.WithMeetScope())
+	}
 	googleClient, err := google.NewClientFromFile(
 		logger,
 		path.Join(*cfgDir, cmd.GoogleConfigPath),
-		google.NewCredentialsManager(path.Join(*cfgDir, cmd.GoogleCredsPath)).ClientOption,
+		googleOptions...,
 	)
 	if err != nil {
 		logger.Fatal(err)
 	}
+	// Zoom is optional: a missing/unreadable zoom config disables Zoom archival
+	// (e.g. a Meet-only install) rather than aborting startup.
 	zoomClient, err := zoom.NewClientFromFile(
 		logger,
 		path.Join(*cfgDir, cmd.ZoomConfigPath),
 		zoom.NewCredentialsManager(path.Join(*cfgDir, cmd.ZoomCredsPath)).ClientOption,
 	)
 	if err != nil {
-		logger.Fatal(err)
+		logger.Printf("zoom archival disabled: %s", err)
+		zoomClient = nil
 	}
 	slackClient, _ := slack.NewClientFromEnvOrFile(logger, path.Join(*cfgDir, cmd.SlackConfigPath), slackapi.OptionHTTPClient(http.DefaultClient))
+
+	// Meet client only when Meet is configured; nil otherwise (handlers guard it).
+	var meetClient *meet.Client
+	if useMeet {
+		meetClient, err = meet.NewClient(logger, googleClient.TokenSource(context.Background()))
+		if err != nil {
+			logger.Fatal(err)
+		}
+	}
 	rp := runParams{
 		minDuration:  *minDuration,
 		since:        *since,
 		uploadFilter: *uploadFilter,
 	}
 
-	zat, err := NewConfigFromFile(logger, path.Join(*cfgDir, cmd.ZatConfigPath), googleClient, zoomClient, slackClient)
+	zat, err := NewConfigFromFile(logger, zatConfigPath, googleClient, zoomClient, meetClient, slackClient)
 	if err != nil {
 		// ok to continue without config, just can't do archival
 		logger.Println("failed to load config", err)

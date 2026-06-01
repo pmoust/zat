@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +19,8 @@ import (
 
 	"github.com/graphaelli/zat/google"
 	googlemock "github.com/graphaelli/zat/google/mock"
+	"github.com/graphaelli/zat/meet"
+	meetmock "github.com/graphaelli/zat/meet/mock"
 	"github.com/graphaelli/zat/zoom"
 	zoommock "github.com/graphaelli/zat/zoom/mock"
 	"github.com/stretchr/testify/assert"
@@ -25,6 +30,7 @@ import (
 var (
 	nopGoogleClient = &google.Client{}
 	nopZoomClient   = &zoom.Client{}
+	nopMeetClient   = &meet.Client{}
 	rp              = runParams{
 		minDuration: 5,
 		since:       24 * time.Hour,
@@ -308,7 +314,215 @@ func TestRecordingFileName(t *testing.T) {
 }
 
 func TestConfigFromFile(t *testing.T) {
-	c, err := NewConfigFromFile(nil, "does-not-exist", nopGoogleClient, nopZoomClient, nil)
+	c, err := NewConfigFromFile(nil, "does-not-exist", nopGoogleClient, nopZoomClient, nopMeetClient, nil)
 	require.NoError(t, err)
 	assert.NotNil(t, c)
+}
+
+func TestMeetRecordingFileName(t *testing.T) {
+	start := time.Date(2026, 5, 20, 13, 0, 0, 0, time.UTC)
+	conf := meet.Conference{StartTime: start}
+	action := Directive{Name: "UI Weekly"}
+
+	tests := []struct {
+		name     string
+		artifact meet.Artifact
+		want     string
+	}{
+		{
+			name:     "recording",
+			artifact: meet.Artifact{Kind: "recording", StartTime: start},
+			want:     "2026-05-20-130000 UI Weekly.mp4",
+		},
+		{
+			name:     "transcript",
+			artifact: meet.Artifact{Kind: "transcript", StartTime: start},
+			want:     "2026-05-20-130000 UI Weekly.transcript",
+		},
+		{
+			name:     "artifact without start falls back to conference start",
+			artifact: meet.Artifact{Kind: "recording"},
+			want:     "2026-05-20-130000 UI Weekly.mp4",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := meetRecordingFileName(action, conf, tt.artifact); got != tt.want {
+				t.Errorf("meetRecordingFileName() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigMeetMapping(t *testing.T) {
+	yml := `
+- name: UI Weekly
+  google: folderA
+  meet: abc-defg-hij
+- name: Dup
+  google: folderB
+  meet: ABCDEFGHIJ
+- name: Team Weekly
+  google: folderC
+  meet: zzz-yyyy-xxx
+`
+	var clog bytes.Buffer
+	c, err := NewConfigFromReader(log.New(&clog, "", 0), strings.NewReader(yml),
+		nopGoogleClient, nopZoomClient, nopMeetClient, nil)
+	require.NoError(t, err)
+
+	// "abc-defg-hij" and "ABCDEFGHIJ" normalize to the same key -> skipDirective
+	dup := c.meetCopies[normalizeMeetingCode("abc-defg-hij")]
+	assert.Equal(t, skipDirective, dup)
+
+	// distinct code maps normally
+	ok := c.meetCopies[normalizeMeetingCode("zzz-yyyy-xxx")]
+	assert.Equal(t, "folderC", ok.Google)
+}
+
+func TestMeetConfigured(t *testing.T) {
+	zoomOnly, err := decodeDirectives(strings.NewReader("- name: Z\n  google: f\n  zoom: 123-456-789\n"))
+	require.NoError(t, err)
+	assert.False(t, meetConfigured(zoomOnly), "zoom-only config should not enable Meet")
+
+	withMeet, err := decodeDirectives(strings.NewReader("- name: M\n  google: f\n  meet: abc-defg-hij\n"))
+	require.NoError(t, err)
+	assert.True(t, meetConfigured(withMeet), "config with a meet directive should enable Meet")
+
+	assert.False(t, meetConfigured(nil), "no directives should not enable Meet")
+}
+
+func TestLoadDirectivesMissingFile(t *testing.T) {
+	directives, err := loadDirectives(filepath.Join(t.TempDir(), "nope.yml"))
+	require.NoError(t, err, "a missing config file should not be an error")
+	assert.Empty(t, directives)
+}
+
+// TestMuxMeetOnly verifies the web UI does not panic when zoomClient is nil
+// (a Meet-only install with no zoom config) and that /zoom 404s.
+func TestMuxMeetOnly(t *testing.T) {
+	var clog bytes.Buffer
+	zat := &Config{
+		logger:       log.New(&clog, "", 0),
+		copies:       map[int64]Directive{},
+		meetCopies:   map[string]Directive{"abcdefghij": {Name: "UI Weekly", Google: "folderA", Meet: "abc-defg-hij"}},
+		googleClient: nopGoogleClient,
+		zoomClient:   nil,
+		meetClient:   nil,
+	}
+	server := httptest.NewServer(NewMux(zat, rp))
+	defer server.Close()
+
+	client := server.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	rsp, err := client.Get(server.URL + "/")
+	require.NoError(t, err)
+	defer rsp.Body.Close()
+	assert.Equal(t, http.StatusOK, rsp.StatusCode, "/ should render without a zoom client")
+
+	zrsp, err := client.Get(server.URL + "/zoom")
+	require.NoError(t, err)
+	defer zrsp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, zrsp.StatusCode, "/zoom should 404 when zoom is disabled")
+}
+
+// loggedInGoogleClient builds a google.Client whose HasCreds() is true by
+// loading a non-expired token from a temp creds file.
+func loggedInGoogleClient(t *testing.T) *google.Client {
+	t.Helper()
+	credsPath := filepath.Join(t.TempDir(), "google.creds.json")
+	b, err := json.Marshal(oauth2.Token{AccessToken: "test-token", Expiry: time.Now().Add(time.Hour)})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(credsPath, b, 0600))
+
+	var clog bytes.Buffer
+	gc, err := google.NewClient(log.New(&clog, "", 0),
+		&oauth2.Config{RedirectURL: "http://localhost:8080/oauth/google"},
+		google.NewCredentialsManager(credsPath).ClientOption)
+	require.NoError(t, err)
+	require.True(t, gc.HasCreds(), "expected loaded creds to be valid")
+	return gc
+}
+
+func meetClientAt(t *testing.T, baseURL string, hc *http.Client) *meet.Client {
+	t.Helper()
+	var mlog bytes.Buffer
+	mc, err := meet.NewClient(log.New(&mlog, "", 0),
+		oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "x"}),
+		meet.CustomHTTPClientOption(hc), meet.CustomBaseURLOption(baseURL))
+	require.NoError(t, err)
+	return mc
+}
+
+func TestMuxMeet(t *testing.T) {
+	noRedirect := func(c *http.Client) { c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse } }
+
+	t.Run("503 when meet client not configured", func(t *testing.T) {
+		var clog bytes.Buffer
+		zat := &Config{logger: log.New(&clog, "", 0), googleClient: loggedInGoogleClient(t), zoomClient: nil, meetClient: nil}
+		srv := httptest.NewServer(NewMux(zat, rp))
+		defer srv.Close()
+
+		rsp, err := srv.Client().Get(srv.URL + "/meet")
+		require.NoError(t, err)
+		defer rsp.Body.Close()
+		assert.Equal(t, http.StatusServiceUnavailable, rsp.StatusCode)
+	})
+
+	t.Run("redirects to login when google creds missing", func(t *testing.T) {
+		var clog bytes.Buffer
+		gc, err := google.NewClient(log.New(&clog, "", 0), &oauth2.Config{RedirectURL: "http://localhost:8080/oauth/google"})
+		require.NoError(t, err)
+		meetSrv := httptest.NewServer(meetmock.ApiHandler(t))
+		defer meetSrv.Close()
+		zat := &Config{logger: log.New(&clog, "", 0), googleClient: gc, zoomClient: nil,
+			meetClient: meetClientAt(t, meetSrv.URL, meetSrv.Client())}
+		srv := httptest.NewServer(NewMux(zat, rp))
+		defer srv.Close()
+
+		client := srv.Client()
+		noRedirect(client)
+		rsp, err := client.Get(srv.URL + "/meet")
+		require.NoError(t, err)
+		defer rsp.Body.Close()
+		assert.Equal(t, http.StatusFound, rsp.StatusCode)
+		assert.Equal(t, "http://localhost:8080/oauth/google", rsp.Header.Get("Location"))
+	})
+
+	t.Run("returns JSON conferences when authed", func(t *testing.T) {
+		meetSrv := httptest.NewServer(meetmock.ApiHandler(t))
+		defer meetSrv.Close()
+		var clog bytes.Buffer
+		zat := &Config{logger: log.New(&clog, "", 0), googleClient: loggedInGoogleClient(t), zoomClient: nil,
+			meetClient: meetClientAt(t, meetSrv.URL, meetSrv.Client())}
+		srv := httptest.NewServer(NewMux(zat, rp))
+		defer srv.Close()
+
+		rsp, err := srv.Client().Get(srv.URL + "/meet")
+		require.NoError(t, err)
+		defer rsp.Body.Close()
+		assert.Equal(t, http.StatusOK, rsp.StatusCode)
+		assert.Equal(t, "application/json", rsp.Header.Get("Content-Type"))
+		var confs []meet.Conference
+		require.NoError(t, json.NewDecoder(rsp.Body).Decode(&confs))
+		assert.Len(t, confs, 1)
+	})
+
+	t.Run("500 when ListConferences errors", func(t *testing.T) {
+		meetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer meetSrv.Close()
+		var clog bytes.Buffer
+		zat := &Config{logger: log.New(&clog, "", 0), googleClient: loggedInGoogleClient(t), zoomClient: nil,
+			meetClient: meetClientAt(t, meetSrv.URL, meetSrv.Client())}
+		srv := httptest.NewServer(NewMux(zat, rp))
+		defer srv.Close()
+
+		rsp, err := srv.Client().Get(srv.URL + "/meet")
+		require.NoError(t, err)
+		defer rsp.Body.Close()
+		assert.Equal(t, http.StatusInternalServerError, rsp.StatusCode)
+	})
 }

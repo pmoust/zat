@@ -51,6 +51,36 @@ Once tokens have been obtained, `zat -no-server` will perform only archival duti
       "oauth_redirect": "http://127.0.0.1.ip.es.io:8080/oauth/zoom"
     }
     ```
+* Google Meet support (optional)
+  * Meet recordings & transcripts already save to the host's Google Drive. `zat`
+    copies them into the mapped folder (the copy is owned by the account `zat`
+    logs in as, which both organizes them and preserves them if the original
+    host later leaves the org).
+  * No separate login: Meet uses the same Google OAuth credentials as Drive.
+  * The Meet scope is **opt-in**: `zat` requests
+    `https://www.googleapis.com/auth/meetings.space.readonly` only when `zat.yml`
+    contains at least one `meet:` directive, so Drive/Zoom-only users are never
+    prompted for Meet permissions.
+  * **When you first add a `meet:` directive**, the requested scope changes, so
+    delete `google.creds.json` and re-run the Google login once to grant it.
+  * Zoom is optional. A Meet-only install needs only the Google credentials —
+    if `zoom.config.json` is absent, `zat` logs that Zoom archival is disabled
+    and continues with Meet.
+  * Map a meeting in `zat.yml` with a `meet:` key holding the meeting code (the
+    `abc-defg-hij` part of a `meet.google.com/abc-defg-hij` link). A directive
+    may set `zoom:`, `meet:`, or both:
+
+    ```yaml
+    - name: UI Weekly
+      google: DpB3XhhzV87LfEeLrM-nCopTtHDWxqVGH
+      meet: abc-defg-hij
+      slack: C0123456
+    ```
+
+  * The `-t` filter accepts `recording` and `transcript` for Meet artifacts.
+  * **Scope:** `zat` only sees Meet conferences for the single signed-in account.
+    Cross-host (org-wide) archival via domain-wide delegation is designed for but
+    not yet implemented.
 * [Optional] Obtain Slack credentials
   * [Create an App](https://api.slack.com/apps?new_app=1)
     * Add Permissions > Scopes > Bot Token Scopes > Add An Oauth Scope granting: `channels:read`, `chat:write`, `chat:write.public`
