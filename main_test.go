@@ -313,6 +313,14 @@ func TestRecordingFileName(t *testing.T) {
 	}
 }
 
+func TestDirectiveOrganizer(t *testing.T) {
+	yml := "- name: Orchestration\n  google: folderA\n  meet: zfc-sfgk-byv\n  organizer: alice@nofire.ai\n"
+	directives, err := decodeDirectives(strings.NewReader(yml))
+	require.NoError(t, err)
+	require.Len(t, directives, 1)
+	assert.Equal(t, "alice@nofire.ai", directives[0].Organizer)
+}
+
 func TestConfigFromFile(t *testing.T) {
 	c, err := NewConfigFromFile(nil, "does-not-exist", nopGoogleClient, nopZoomClient, nopMeetClient, nil)
 	require.NoError(t, err)

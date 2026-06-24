@@ -1,0 +1,32 @@
+# zat archival config. `name` is used in the archived folder/file names, so set
+# it to whatever you want the recordings labeled as. `google` is the Drive
+# folder ID, `meet` is the meeting code (the abc-defg-hij part of a
+# meet.google.com link), `organizer` is the Workspace email that owns/created the meeting; zat
+# impersonates it (domain-wide delegation) to read the recording, because the
+# Meet API only lists conferences to their organizer. `slack` is the channel ID to notify.
+#
+# Editing this file and merging to main pushes a new Secret Manager version;
+# the change takes effect on the next 2-hourly run. See zat/README.md.
+- name: eng-all-hands
+  google: 1md47_0LNV3uMcG3W7v__huKxV58w14R0
+  meet: ytd-xhmc-rtr
+  organizer: REPLACE_WITH_ORGANIZER@nofire.ai
+  slack: C087PMJ6ZHV
+
+- name: orchestration-context
+  google: 13zgBJoEypNrz4iCxMk2_vee73Bk9-uHX
+  meet: zfc-sfgk-byv
+  organizer: REPLACE_WITH_ORGANIZER@nofire.ai
+  slack: C0B1FBT1URY
+
+- name: runtime-controls
+  google: 1zeZn7a0olGn8HRG-lhA2dX_Pui_XIg4w
+  meet: csq-phqy-acr
+  organizer: REPLACE_WITH_ORGANIZER@nofire.ai
+  slack: C0B1BV2266R
+
+- name: core-infra-weekly
+  google: 1_8yo36OPSz5bMhhAZkwTFf3MXgN8bwsT
+  meet: cus-ktmp-cjg
+  organizer: REPLACE_WITH_ORGANIZER@nofire.ai
+  slack: C0B7E130MC5

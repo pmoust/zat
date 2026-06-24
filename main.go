@@ -216,11 +216,12 @@ func NewMux(zat *Config, params runParams) *http.ServeMux {
 }
 
 type Directive struct {
-	Name   string `json:"name"`
-	Google string `json:"google"`
-	Zoom   string `json:"zoom"`
-	Meet   string `json:"meet"`
-	Slack  string `json:"slack"`
+	Name      string `json:"name"`
+	Google    string `json:"google"`
+	Zoom      string `json:"zoom"`
+	Meet      string `json:"meet"`
+	Organizer string `json:"organizer"`
+	Slack     string `json:"slack"`
 }
 
 // use invalid json to avoid conflict
