@@ -499,6 +499,24 @@ func TestConferenceArchivable(t *testing.T) {
 	assert.False(t, ok, "non-matching code should not archive")
 }
 
+func TestMeetArchivalReady(t *testing.T) {
+	imp := google.NewImpersonator("sa@p.iam.gserviceaccount.com", []string{google.MeetScope})
+
+	ready := &Config{
+		meetCopies:   map[string]Directive{"abcdefghij": {Name: "A", Google: "f", Meet: "abc-defg-hij", Organizer: "a@x.com"}},
+		impersonator: imp,
+	}
+	assert.True(t, meetArchivalReady(ready))
+
+	noImp := &Config{
+		meetCopies: map[string]Directive{"abcdefghij": {Name: "A", Google: "f", Meet: "abc-defg-hij", Organizer: "a@x.com"}},
+	}
+	assert.False(t, meetArchivalReady(noImp), "no impersonator means not ready")
+
+	noDirectives := &Config{impersonator: imp, meetCopies: map[string]Directive{}}
+	assert.False(t, meetArchivalReady(noDirectives), "no meet directives means not ready")
+}
+
 func TestMuxMeet(t *testing.T) {
 	noRedirect := func(c *http.Client) { c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse } }
 

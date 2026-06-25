@@ -884,20 +884,50 @@ var (
 	archDetails     = []*archivedMeeting{}
 )
 
+// meetArchivalReady reports whether per-organizer Meet archival can run: an
+// impersonator is configured and at least one Meet directive exists.
+func meetArchivalReady(z *Config) bool {
+	return z.impersonator != nil && len(z.meetDirectives()) > 0
+}
+
+// runtimeServiceAccountEmail resolves the service account zat signs JWTs as.
+// It prefers the ZAT_IMPERSONATOR_SA env var (set in local dev), then falls
+// back to the GCE/Cloud Run metadata server.
+func runtimeServiceAccountEmail(ctx context.Context) (string, error) {
+	if v := os.Getenv("ZAT_IMPERSONATOR_SA"); v != "" {
+		return v, nil
+	}
+	const mdURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mdURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+	rsp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("resolving runtime SA from metadata: %w", err)
+	}
+	defer rsp.Body.Close()
+	if rsp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("metadata server returned %d for SA email", rsp.StatusCode)
+	}
+	b, err := io.ReadAll(rsp.Body)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
 func doRun(zat *Config, params runParams) {
 	if zat == nil {
 		// no logger to log with
 		return
 	}
 	zat.logger.Print("starting archive tool")
-	if !zat.googleClient.HasCreds() {
-		zat.logger.Println("no Google creds")
-		return
-	}
 	// zoomClient is nil on a Meet-only install (no zoom config).
 	zoomReady := zat.zoomClient != nil && zat.zoomClient.HasCreds()
-	if !zoomReady && len(zat.meetCopies) == 0 {
-		zat.logger.Println("no Zoom creds and no Meet directives")
+	if !zoomReady && !meetArchivalReady(zat) {
+		zat.logger.Println("nothing to archive: no Zoom creds and no Meet impersonation/directives")
 		return
 	}
 
@@ -920,7 +950,7 @@ func doRun(zat *Config, params runParams) {
 			zat.logger.Println(err)
 		}
 	}
-	if zat.meetClient != nil && len(zat.meetCopies) > 0 && zat.googleClient.HasCreds() {
+	if meetArchivalReady(zat) {
 		if err := zat.RunMeet(params); err != nil {
 			zat.logger.Println(err)
 		}
@@ -1004,6 +1034,18 @@ func main() {
 	if err != nil {
 		// ok to continue without config, just can't do archival
 		logger.Println("failed to load config", err)
+	}
+
+	if useMeet && zat != nil {
+		saEmail, err := runtimeServiceAccountEmail(context.Background())
+		if err != nil {
+			logger.Printf("meet archival disabled: %v", err)
+		} else {
+			zat.impersonator = google.NewImpersonator(
+				saEmail,
+				[]string{google.MeetScope, drive.DriveScope},
+			)
+		}
 	}
 
 	var wg sync.WaitGroup
