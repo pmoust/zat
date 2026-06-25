@@ -83,7 +83,7 @@ func NewMux(zat *Config, params runParams) *http.ServeMux {
 
 		if meetClient != nil {
 			mw.Write([]byte("<br>Meet: "))
-			if googleClient.HasCreds() {
+			if meetArchivalReady(zat) || googleClient.HasCreds() {
 				mw.Write([]byte("<span style=\"color:green\">OK</span>"))
 			} else {
 				mw.Write([]byte("<a href=\"/google\">login</a>"))
@@ -92,7 +92,7 @@ func NewMux(zat *Config, params runParams) *http.ServeMux {
 
 		if archIsRunning {
 			mw.Write([]byte("<br/>Archiving...</a>"))
-		} else if googleClient.HasCreds() && (zoomReady() || len(zat.meetCopies) > 0) {
+		} else if meetArchivalReady(zat) || (googleClient.HasCreds() && (zoomReady() || len(zat.meetCopies) > 0)) {
 			mw.Write([]byte("<br/><a href=\"/archive\">Archive Now</a>"))
 		} else {
 			mw.Write([]byte("<br/>Login, to be able to archive"))
@@ -887,6 +887,9 @@ var (
 // meetArchivalReady reports whether per-organizer Meet archival can run: an
 // impersonator is configured and at least one Meet directive exists.
 func meetArchivalReady(z *Config) bool {
+	if z == nil {
+		return false
+	}
 	return z.impersonator != nil && len(z.meetDirectives()) > 0
 }
 
@@ -898,6 +901,8 @@ func runtimeServiceAccountEmail(ctx context.Context) (string, error) {
 		return v, nil
 	}
 	const mdURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email"
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mdURL, nil)
 	if err != nil {
 		return "", err
@@ -909,11 +914,11 @@ func runtimeServiceAccountEmail(ctx context.Context) (string, error) {
 	}
 	defer rsp.Body.Close()
 	if rsp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("metadata server returned %d for SA email", rsp.StatusCode)
+		return "", fmt.Errorf("metadata server %s returned %d for SA email", mdURL, rsp.StatusCode)
 	}
 	b, err := io.ReadAll(rsp.Body)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("reading SA email from metadata: %w", err)
 	}
 	return strings.TrimSpace(string(b)), nil
 }
