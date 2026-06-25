@@ -52,11 +52,12 @@ Once tokens have been obtained, `zat -no-server` will perform only archival duti
     }
     ```
 * Google Meet support (optional)
-  * Meet recordings & transcripts already save to the host's Google Drive. `zat`
-    copies them into the mapped folder (the copy is owned by the account `zat`
-    logs in as, which both organizes them and preserves them if the original
-    host later leaves the org).
-  * No separate login: Meet uses the same Google OAuth credentials as Drive.
+  * Meet recordings & transcripts already save to the organizer's Google Drive.
+    `zat` discovers and copies them while authenticated **as each meeting's
+    organizer** (Google's Meet API only lists a conference to its organizer), so
+    it can archive meetings organized by anyone in the workspace, not just the
+    account `zat` runs as. The copy is written to the mapped destination, which
+    must be a Shared Drive the organizer can write to.
   * The Meet scope is **opt-in**: `zat` requests
     `https://www.googleapis.com/auth/meetings.space.readonly` only when `zat.yml`
     contains at least one `meet:` directive, so Drive/Zoom-only users are never
@@ -67,20 +68,31 @@ Once tokens have been obtained, `zat -no-server` will perform only archival duti
     if `zoom.config.json` is absent, `zat` logs that Zoom archival is disabled
     and continues with Meet.
   * Map a meeting in `zat.yml` with a `meet:` key holding the meeting code (the
-    `abc-defg-hij` part of a `meet.google.com/abc-defg-hij` link). A directive
-    may set `zoom:`, `meet:`, or both:
+    `abc-defg-hij` part of a `meet.google.com/abc-defg-hij` link) and an
+    `organizer:` key holding the Workspace email that owns the meeting. A
+    directive may set `zoom:`, `meet:`, or both:
 
     ```yaml
     - name: UI Weekly
-      google: DpB3XhhzV87LfEeLrM-nCopTtHDWxqVGH
+      google: DpB3XhhzV87LfEeLrM-nCopTtHDWxqVGH   # a Shared Drive folder
       meet: abc-defg-hij
+      organizer: alice@example.com
       slack: C0123456
     ```
 
   * The `-t` filter accepts `recording` and `transcript` for Meet artifacts.
-  * **Scope:** `zat` only sees Meet conferences for the single signed-in account.
-    Cross-host (org-wide) archival via domain-wide delegation is designed for but
-    not yet implemented.
+  * **Organizer impersonation (domain-wide delegation):** `zat` reads each
+    meeting as its `organizer` via keyless DWD — no service-account key. One-time
+    Workspace + GCP setup:
+    * Run as a service account (Cloud Run runtime SA, or set
+      `ZAT_IMPERSONATOR_SA=<sa-email>` locally with ADC that can impersonate it).
+    * Enable `iamcredentials.googleapis.com`; grant the SA
+      `roles/iam.serviceAccountTokenCreator` **on itself**.
+    * In the Admin console (Security → API controls → Domain-wide delegation),
+      authorize the SA's client ID for exactly
+      `https://www.googleapis.com/auth/meetings.space.readonly` and
+      `https://www.googleapis.com/auth/drive`.
+    * Grant each `organizer` Content Manager on the destination Shared Drive.
 * [Optional] Obtain Slack credentials
   * [Create an App](https://api.slack.com/apps?new_app=1)
     * Add Permissions > Scopes > Bot Token Scopes > Add An Oauth Scope granting: `channels:read`, `chat:write`, `chat:write.public`
