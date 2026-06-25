@@ -11,6 +11,17 @@ import (
 	"golang.org/x/oauth2"
 )
 
+func TestDriveServiceForTokenSource(t *testing.T) {
+	svc, err := DriveServiceForTokenSource(context.Background(),
+		oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "x"}))
+	if err != nil {
+		t.Fatalf("DriveServiceForTokenSource error: %v", err)
+	}
+	if svc == nil {
+		t.Fatal("expected a drive service, got nil")
+	}
+}
+
 func TestNewClientFromReader(t *testing.T) {
 	tests := []struct {
 		name     string

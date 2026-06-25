@@ -463,6 +463,42 @@ func meetClientAt(t *testing.T, baseURL string, hc *http.Client) *meet.Client {
 	return mc
 }
 
+func TestMeetDirectives(t *testing.T) {
+	yml := "- name: A\n  google: fA\n  meet: abc-defg-hij\n  organizer: a@x.com\n" +
+		"- name: Dup\n  google: fB\n  meet: ABCDEFGHIJ\n  organizer: a@x.com\n" +
+		"- name: B\n  google: fC\n  meet: zzz-yyyy-xxx\n  organizer: b@x.com\n" +
+		"- name: Zoom\n  google: fD\n  zoom: 111-222-333\n"
+	var clog bytes.Buffer
+	c, err := NewConfigFromReader(log.New(&clog, "", 0), strings.NewReader(yml),
+		nopGoogleClient, nopZoomClient, nopMeetClient, nil)
+	require.NoError(t, err)
+
+	var names []string
+	for _, d := range c.meetDirectives() {
+		names = append(names, d.Name)
+	}
+	// duplicate code collapses to skipDirective (dropped); zoom-only dropped.
+	assert.ElementsMatch(t, []string{"B"}, names)
+}
+
+func TestConferenceArchivable(t *testing.T) {
+	start := time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC)
+	action := Directive{Name: "Orchestration", Meet: "zfc-sfgk-byv", Google: "fA", Organizer: "a@x.com"}
+
+	long := meet.Conference{MeetingCode: "zfc-sfgk-byv", StartTime: start, EndTime: start.Add(30 * time.Minute)}
+	ok, reason := conferenceArchivable(action, long, 5)
+	assert.True(t, ok, "30-min matching conference should archive (%s)", reason)
+
+	short := meet.Conference{MeetingCode: "zfc-sfgk-byv", StartTime: start, EndTime: start.Add(2 * time.Minute)}
+	ok, reason = conferenceArchivable(action, short, 5)
+	assert.False(t, ok)
+	assert.Contains(t, reason, "2 minute")
+
+	other := meet.Conference{MeetingCode: "rvg-aokd-psz", StartTime: start, EndTime: start.Add(30 * time.Minute)}
+	ok, _ = conferenceArchivable(action, other, 5)
+	assert.False(t, ok, "non-matching code should not archive")
+}
+
 func TestMuxMeet(t *testing.T) {
 	noRedirect := func(c *http.Client) { c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse } }
 

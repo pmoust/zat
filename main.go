@@ -236,6 +236,7 @@ type Config struct {
 	slackClient  *slackapi.Client
 	zoomClient   *zoom.Client
 	meetClient   *meet.Client
+	impersonator *google.Impersonator
 }
 
 func NewConfigFromFile(logger *log.Logger, path string, googleClient *google.Client, zoomClient *zoom.Client,
@@ -615,22 +616,9 @@ func (z *Config) Archive(ctx context.Context, meeting zoom.Meeting, params runPa
 	return nil
 }
 
-func (z *Config) archiveMeetConference(ctx context.Context, conf meet.Conference, params runParams) error {
+func (z *Config) archiveMeetConference(ctx context.Context, gdrive *drive.Service, action Directive, conf meet.Conference, params runParams) error {
 	span, ctx := apm.StartSpan(ctx, "archiveMeetConference", "app")
 	defer span.End()
-
-	// ListConferences returns every conference the account attended, so an
-	// unmapped or duplicate-disabled meeting code is the common case, not an
-	// error worth reporting to APM - log and skip quietly.
-	action := z.meetCopies[normalizeMeetingCode(conf.MeetingCode)]
-	if action == skipDirective {
-		z.logger.Printf("skipped mapping meet conference %q", conf.MeetingCode)
-		return nil
-	}
-	if action.Google == "" {
-		z.logger.Printf("no mapping found for meet conference %q, skipping", conf.MeetingCode)
-		return nil
-	}
 
 	// nothing to copy (e.g. a mapped meeting occurred but wasn't recorded) -
 	// skip before creating an empty dated folder in Drive.
@@ -647,12 +635,6 @@ func (z *Config) archiveMeetConference(ctx context.Context, conf meet.Conference
 		sourceUrl:  conf.SourceURL,
 	}
 	archDetails = append(archDetails, &curArchMeeting)
-
-	gdrive, err := z.googleClient.Service(ctx)
-	if err != nil {
-		curArchMeeting.status = "error"
-		return fmt.Errorf("while creating gdrive client: %w", err)
-	}
 
 	parent, err := gdrive.Files.Get(action.Google).Context(ctx).SupportsAllDrives(true).Do()
 	if err != nil {
@@ -792,31 +774,98 @@ func (z *Config) Run(params runParams) error {
 	return nil
 }
 
+// meetDirectives returns the configured, non-duplicate directives that map a
+// Meet meeting to a destination folder.
+func (z *Config) meetDirectives() []Directive {
+	seen := map[string]bool{}
+	var out []Directive
+	for _, d := range z.meetCopies {
+		if d == skipDirective || d.Meet == "" || d.Google == "" {
+			continue
+		}
+		key := normalizeMeetingCode(d.Meet)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, d)
+	}
+	return out
+}
+
+// conferenceArchivable reports whether conf belongs to action's meeting and is
+// long enough to archive. When false, skipReason explains why (for logging).
+func conferenceArchivable(action Directive, conf meet.Conference, minDuration int) (bool, string) {
+	if normalizeMeetingCode(conf.MeetingCode) != normalizeMeetingCode(action.Meet) {
+		return false, "different meeting code"
+	}
+	if !conf.EndTime.IsZero() && !conf.StartTime.IsZero() {
+		duration := int(conf.EndTime.Sub(conf.StartTime).Minutes())
+		if duration < minDuration {
+			return false, fmt.Sprintf("%d minute conference at %s", duration, conf.StartTime)
+		}
+	}
+	return true, ""
+}
+
 func (z *Config) RunMeet(params runParams) error {
 	tx := apm.DefaultTracer.StartTransaction("archiveMeetRecordings", "background")
 	defer tx.End()
 	ctx := apm.ContextWithTransaction(context.Background(), tx)
 
 	z.logger.Print("archiving meet recordings")
-	conferences, err := z.meetClient.ListConferences(ctx, time.Now().Add(-1*params.since))
-	if err != nil {
-		apm.CaptureError(ctx, err).Send()
-		return fmt.Errorf("failed to list meet conferences: %w", err)
-	}
-	for _, conf := range conferences {
-		if !conf.EndTime.IsZero() && !conf.StartTime.IsZero() {
-			duration := int(conf.EndTime.Sub(conf.StartTime).Minutes())
-			if duration < params.minDuration {
-				z.logger.Printf("skipped %d minute meet conference at %s", duration, conf.StartTime)
-				continue
-			}
-		}
-		if err := z.archiveMeetConference(ctx, conf, params); err != nil {
-			z.logger.Print(err)
+	for _, action := range z.meetDirectives() {
+		if err := z.runMeetDirective(ctx, action, params); err != nil {
+			z.logger.Printf("meet %q (%s): %v", action.Name, action.Meet, err)
 			apm.CaptureError(ctx, err).Send()
 		}
 	}
 	z.logger.Print("done archiving meet recordings")
+	return nil
+}
+
+// runMeetDirective discovers and archives one mapped meeting, authenticated as
+// that meeting's organizer.
+func (z *Config) runMeetDirective(ctx context.Context, action Directive, params runParams) error {
+	if action.Organizer == "" {
+		z.logger.Printf("no organizer for meet %q, skipping", action.Meet)
+		return nil
+	}
+	if z.impersonator == nil {
+		return fmt.Errorf("no impersonator configured")
+	}
+	ts, err := z.impersonator.TokenSource(ctx, action.Organizer)
+	if err != nil {
+		return fmt.Errorf("impersonating %s: %w", action.Organizer, err)
+	}
+
+	meetClient, err := meet.NewClient(z.logger, ts)
+	if err != nil {
+		return fmt.Errorf("building meet client: %w", err)
+	}
+	conferences, err := meetClient.ListConferences(ctx, time.Now().Add(-1*params.since))
+	if err != nil {
+		return fmt.Errorf("listing conferences: %w", err)
+	}
+
+	gdrive, err := google.DriveServiceForTokenSource(ctx, ts)
+	if err != nil {
+		return fmt.Errorf("building drive client: %w", err)
+	}
+
+	for _, conf := range conferences {
+		ok, reason := conferenceArchivable(action, conf, params.minDuration)
+		if !ok {
+			if reason != "different meeting code" {
+				z.logger.Printf("skipped meet %q: %s", action.Meet, reason)
+			}
+			continue
+		}
+		if err := z.archiveMeetConference(ctx, gdrive, action, conf, params); err != nil {
+			z.logger.Print(err)
+			apm.CaptureError(ctx, err).Send()
+		}
+	}
 	return nil
 }
 

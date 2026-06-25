@@ -203,6 +203,12 @@ func (c *Client) Service(ctx context.Context) (*drive.Service, error) {
 	return drive.NewService(ctx, option.WithTokenSource(c.config.TokenSource(ctx, c.getCreds())))
 }
 
+// DriveServiceForTokenSource builds a Drive client from an arbitrary token
+// source (e.g. an impersonated organizer), independent of the web-login creds.
+func DriveServiceForTokenSource(ctx context.Context, ts oauth2.TokenSource) (*drive.Service, error) {
+	return drive.NewService(ctx, option.WithTokenSource(ts))
+}
+
 func (c *Client) ListFiles(ctx context.Context, q string, pageToken string) (*drive.FileList, error) {
 	driveService, err := c.Service(ctx)
 	if err != nil {
